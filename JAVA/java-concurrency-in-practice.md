@@ -836,4 +836,683 @@ while (true) {
 - `ConcurrentHashMap.size()`: Returns approximation, don't rely on exactness
 - Work stealing: Better than shared queue for recursive problems
 
+---
+
+# Chapter 6: Task Execution - Summary
+
+## Overview
+This chapter explores organizing concurrent applications around **task execution**, moving from manual thread creation to the powerful **Executor framework**. Most concurrent applications are naturally structured around discrete units of work (tasks), and properly managing their execution is crucial for performance, responsiveness, and resource management.
+
+---
+
+## 6.1 Executing Tasks in Threads
+
+### Identifying Task Boundaries
+**Ideal tasks are**:
+- **Independent**: Don't depend on state, results, or side effects of other tasks
+- **Small**: Represent a small fraction of application's processing capacity
+- **Natural units**: E.g., individual client requests (HTTP, mail, database queries)
+
+**Benefits of good task boundaries**:
+- ✓ Simplifies program organization
+- ✓ Facilitates error recovery (natural transaction boundaries)
+- ✓ Promotes concurrency through natural parallelization
+
+---
+
+### 6.1.1 Sequential Execution (SingleThreadWebServer)
+
+```java
+class SingleThreadWebServer {
+    public static void main(String[] args) throws IOException {
+        ServerSocket socket = new ServerSocket(80);
+        while (true) {
+            Socket connection = socket.accept();
+            handleRequest(connection);  // Blocks everything!
+        }
+    }
+}
+```
+
+**Problems**:
+- ✗ **Poor responsiveness**: New connections wait while request is processed
+- ✗ **Poor throughput**: CPU sits idle during I/O operations
+- ✗ **Poor resource utilization**: Single thread can't utilize multiple processors
+- ✗ **Blocking**: One slow request blocks all others
+
+**When acceptable**: 
+- Tasks are few and long-lived
+- Server serves single client making one request at a time
+- (Rare in real server applications)
+
+---
+
+### 6.1.2 Thread-Per-Task (ThreadPerTaskWebServer)
+
+```java
+class ThreadPerTaskWebServer {
+    public static void main(String[] args) throws IOException {
+        ServerSocket socket = new ServerSocket(80);
+        while (true) {
+            final Socket connection = socket.accept();
+            Runnable task = new Runnable() {
+                public void run() { handleRequest(connection); }
+            };
+            new Thread(task).start();  // Create new thread for each request
+        }
+    }
+}
+```
+
+**Improvements**:
+- ✓ **Better responsiveness**: Main thread resumes accepting connections immediately
+- ✓ **Parallel processing**: Multiple requests handled simultaneously
+- ✓ **Better throughput**: Especially on multiprocessor systems
+
+**Requirements**:
+- Task-handling code must be thread-safe (concurrent invocations)
+
+---
+
+### 6.1.3 Disadvantages of Unbounded Thread Creation
+
+⚠️ **Major Problems**:
+
+#### 1. Thread Lifecycle Overhead
+- Thread creation and teardown consume significant resources
+- Introduces latency into request processing
+- For lightweight, frequent requests, overhead can dominate
+
+#### 2. Resource Consumption
+- **Active threads consume memory** (stacks, thread-local storage)
+- Idle threads tie up memory and stress garbage collector
+- Too many threads competing for CPUs → context switching overhead
+- Beyond keeping CPUs busy, more threads = worse performance
+
+#### 3. Stability Issues
+- **Platform limits** on number of threads (OS, JVM, hardware dependent)
+- Hitting limit typically → `OutOfMemoryError`
+- Recovery from `OutOfMemoryError` is extremely risky
+- On 32-bit JVMs: ~½ MB stack per thread → few thousand threads max
+
+**Critical Failure Mode**:
+- No inherent limit on thread creation
+- Can crash under heavy load or malicious traffic
+- Violates requirement for graceful degradation
+
+**Lesson**: Must place bounds on thread creation
+
+---
+
+## 6.2 The Executor Framework
+
+### Core Abstraction
+
+```java
+public interface Executor {
+    void execute(Runnable command);
+}
+```
+
+**Key innovation**: Decouples **task submission** from **task execution**
+
+**Benefits**:
+- Flexible execution policies (sequential, thread-per-task, thread pool, etc.)
+- Standard mechanism for task submission
+- Easier to change execution policy without changing task submission code
+- Based on **producer-consumer pattern**: Tasks are produced, threads consume them
+
+---
+
+### 6.2.1 Example: Web Server Using Executor
+
+```java
+class TaskExecutionWebServer {
+    private static final int NTHREADS = 100;
+    private static final Executor exec = Executors.newFixedThreadPool(NTHREADS);
+    
+    public static void main(String[] args) throws IOException {
+        ServerSocket socket = new ServerSocket(80);
+        while (true) {
+            final Socket connection = socket.accept();
+            Runnable task = () -> handleRequest(connection);
+            exec.execute(task);  // Submit to executor
+        }
+    }
+}
+```
+
+**Advantages**:
+- ✓ Bounds resource usage (max 100 threads)
+- ✓ Won't crash under heavy load
+- ✓ Easy to change behavior by swapping `Executor` implementation
+- ✓ Graceful degradation under load
+
+---
+
+### 6.2.2 Execution Policies
+
+**Defines the "what, where, when, and how" of task execution**:
+
+1. **In what thread** will tasks execute?
+2. **In what order** (FIFO, LIFO, priority)?
+3. **How many tasks** may execute concurrently?
+4. **How many tasks** may be queued pending execution?
+5. **If overloaded**, which task to reject and how to notify?
+6. **What actions** before/after task execution?
+
+**Resource management tool**: Optimal policy depends on:
+- Available computing resources (CPUs, memory)
+- Quality-of-service requirements
+
+⚠️ **Replacement pattern**: Whenever you see `new Thread(runnable).start()`, seriously consider using an `Executor` instead.
+
+---
+
+### 6.2.3 Thread Pools
+
+**How they work**:
+- Manage homogeneous pool of **worker threads**
+- Workers request tasks from **work queue**, execute them, return for more
+- Reuse existing threads instead of creating new ones
+
+**Advantages over thread-per-task**:
+- ✓ **Amortized creation costs**: Thread creation/teardown spread over many requests
+- ✓ **Better responsiveness**: Worker often exists when request arrives (no creation latency)
+- ✓ **Tunable**: Size pool to keep processors busy without exhausting resources
+
+---
+
+#### Standard Thread Pool Factories (Executors)
+
+| Factory Method | Description | Use When |
+|----------------|-------------|----------|
+| `newFixedThreadPool(n)` | Fixed-size pool (n threads) | Known workload, want bounded resource usage |
+| `newCachedThreadPool()` | Unbounded pool, reaps idle threads | Many short-lived tasks, bursty load |
+| `newSingleThreadExecutor()` | Single worker thread | Need sequential execution (FIFO, LIFO, priority) |
+| `newScheduledThreadPool(n)` | Fixed-size, supports delayed/periodic tasks | Like Timer but better |
+
+**Configuration**:
+- All return `ThreadPoolExecutor` instances
+- Can construct `ThreadPoolExecutor` directly for specialized needs (Chapter 8)
+
+**Effect on stability**:
+- Fixed/single pools provide bounded resource usage
+- Prevents failure under heavy load
+- Enables tuning, monitoring, logging, error reporting
+
+---
+
+### 6.2.4 Executor Lifecycle
+
+**Problem**: JVM can't exit until all non-daemon threads terminate
+
+**ExecutorService interface** extends Executor with lifecycle methods:
+
+```java
+public interface ExecutorService extends Executor {
+    void shutdown();                          // Graceful shutdown
+    List<Runnable> shutdownNow();            // Abrupt shutdown
+    boolean isShutdown();
+    boolean isTerminated();
+    boolean awaitTermination(long timeout, TimeUnit unit);
+    // ... task submission convenience methods
+}
+```
+
+#### Three States:
+1. **Running**: Normal operation
+2. **Shutting down**: No new tasks accepted, existing tasks complete
+3. **Terminated**: All tasks completed
+
+#### Shutdown Methods:
+
+**`shutdown()`** - Graceful:
+- No new tasks accepted
+- Previously submitted tasks (including queued) allowed to complete
+
+**`shutdownNow()`** - Abrupt:
+- Attempts to cancel outstanding tasks
+- Doesn't start queued tasks
+- Returns list of tasks that were queued but never started
+
+#### Pattern:
+```java
+exec.shutdown();                    // Initiate shutdown
+exec.awaitTermination(timeout);     // Wait for completion
+// Or combine for synchronous shutdown effect
+```
+
+---
+
+#### Example: LifecycleWebServer
+
+```java
+class LifecycleWebServer {
+    private final ExecutorService exec = ...;
+    
+    public void start() throws IOException {
+        ServerSocket socket = new ServerSocket(80);
+        while (!exec.isShutdown()) {
+            try {
+                final Socket conn = socket.accept();
+                exec.execute(() -> handleRequest(conn));
+            } catch (RejectedExecutionException e) {
+                if (!exec.isShutdown())
+                    log("task submission rejected", e);
+            }
+        }
+    }
+    
+    public void stop() { exec.shutdown(); }
+    
+    void handleRequest(Socket connection) {
+        Request req = readRequest(connection);
+        if (isShutdownRequest(req))
+            stop();  // Programmatic shutdown
+        else
+            dispatchRequest(req);
+    }
+}
+```
+
+**Features**:
+- Programmatic shutdown via `stop()`
+- Client-triggered shutdown via special HTTP request
+- Proper handling of `RejectedExecutionException`
+
+---
+
+### 6.2.5 Delayed and Periodic Tasks
+
+#### Timer Problems:
+- ✗ **Single thread**: One long task delays all others
+- ✗ **Unchecked exceptions**: Kill timer thread, no recovery ("thread leakage")
+- ✗ **Confusing behavior**: Throws `IllegalStateException` for future submissions
+
+```java
+// Timer misbehavior example
+public class OutOfTime {
+    public static void main(String[] args) throws Exception {
+        Timer timer = new Timer();
+        timer.schedule(new ThrowTask(), 1);
+        SECONDS.sleep(1);
+        timer.schedule(new ThrowTask(), 1);  // IllegalStateException!
+        SECONDS.sleep(5);
+    }
+    
+    static class ThrowTask extends TimerTask {
+        public void run() { throw new RuntimeException(); }
+    }
+}
+```
+**Expected**: Run for 6 seconds
+**Actual**: Terminates after 1 second with `IllegalStateException`
+
+#### ScheduledThreadPoolExecutor (Use Instead):
+- ✓ Multiple threads for scheduled tasks
+- ✓ Handles ill-behaved tasks properly
+- ✓ More robust and flexible
+
+**Building custom schedulers**: Use `DelayQueue` (implements `BlockingQueue` with delay semantics)
+
+---
+
+## 6.3 Finding Exploitable Parallelism
+
+**Goal**: Identify good task boundaries to maximize concurrency
+
+**Example domain**: HTML page rendering
+- Parse HTML
+- Render text elements
+- Download images
+- Display images
+
+---
+
+### 6.3.1 Sequential Page Renderer
+
+```java
+public class SingleThreadRenderer {
+    void renderPage(CharSequence source) {
+        renderText(source);  // Render text first
+        List<ImageData> imageData = new ArrayList<>();
+        for (ImageInfo imageInfo : scanForImageInfo(source))
+            imageData.add(imageInfo.downloadImage());  // Download images
+        for (ImageData data : imageData)
+            renderImage(data);  // Display images
+    }
+}
+```
+
+**Problems**:
+- ✗ Downloads images sequentially (wastes time)
+- ✗ CPU idle during I/O waits
+- ✗ User waits longer than necessary
+
+---
+
+### 6.3.2 Result-Bearing Tasks: Callable and Future
+
+#### Limitations of Runnable:
+- Cannot return a value
+- Cannot throw checked exceptions
+- Must use side effects (shared data structures, logs)
+
+#### Callable - Better Abstraction:
+
+```java
+public interface Callable<V> {
+    V call() throws Exception;  // Can return value and throw exceptions
+}
+```
+
+#### Future - Task Lifecycle:
+
+```java
+public interface Future<V> {
+    boolean cancel(boolean mayInterruptIfRunning);
+    boolean isCancelled();
+    boolean isDone();
+    V get() throws InterruptedException, ExecutionException, CancellationException;
+    V get(long timeout, TimeUnit unit) throws ...;
+}
+```
+
+**Task states**: Created → Submitted → Started → Completed
+- Lifecycle only moves forward
+- Once completed, stays completed forever
+
+**`get()` behavior**:
+- Returns immediately if task completed
+- Blocks if task still running
+- Throws `ExecutionException` if task threw exception
+- Throws `CancellationException` if task was cancelled
+
+**Creating Futures**:
+- `ExecutorService.submit(Callable)` returns `Future`
+- `ExecutorService.submit(Runnable)` returns `Future<?>`
+- Explicitly instantiate `FutureTask`
+
+---
+
+### 6.3.3 Example: Page Renderer with Future
+
+```java
+public class FutureRenderer {
+    private final ExecutorService executor = ...;
+    
+    void renderPage(CharSequence source) {
+        final List<ImageInfo> imageInfos = scanForImageInfo(source);
+        
+        Callable<List<ImageData>> task = () -> {
+            List<ImageData> result = new ArrayList<>();
+            for (ImageInfo imageInfo : imageInfos)
+                result.add(imageInfo.downloadImage());
+            return result;
+        };
+        
+        Future<List<ImageData>> future = executor.submit(task);
+        
+        renderText(source);  // Render text while images download
+        
+        try {
+            List<ImageData> imageData = future.get();  // Wait for images
+            for (ImageData data : imageData)
+                renderImage(data);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            future.cancel(true);
+        } catch (ExecutionException e) {
+            throw launderThrowable(e.getCause());
+        }
+    }
+}
+```
+
+**Improvements**:
+- ✓ Text rendering concurrent with image downloading
+- ✓ User sees text quickly
+- ✓ Better CPU utilization
+
+**Limitation**: Still waits for ALL images before displaying any
+
+---
+
+### 6.3.4 Limitations of Parallelizing Heterogeneous Tasks
+
+**Problem with heterogeneous parallelization**:
+
+**Analogy**: Washing dishes
+- Two people: One washes, one dries → works well
+- More people: Hard to find roles, diminishing returns
+
+**Issues**:
+1. **Limited scalability**: Two tasks → max 2x speedup
+2. **Disparate task sizes**: If one task is 10x longer, overall speedup < 2x
+3. **Coordination overhead**: Must be outweighed by parallelism benefits
+
+**Real performance payoff**: Large number of **independent, homogeneous** tasks
+
+---
+
+### 6.3.5 CompletionService: Executor Meets BlockingQueue
+
+**Problem**: Retrieving results as they complete is tedious with `Future.get(0)`
+
+**Solution**: `CompletionService`
+
+```java
+public interface CompletionService<V> {
+    Future<V> submit(Callable<V> task);
+    Future<V> submit(Runnable task, V result);
+    Future<V> take() throws InterruptedException;      // Blocks until result available
+    Future<V> poll();                                   // Returns null if none available
+    Future<V> poll(long timeout, TimeUnit unit);       // Timed poll
+}
+```
+
+**How it works** (`ExecutorCompletionService`):
+- Wraps submitted tasks in `QueueingFuture`
+- `QueueingFuture.done()` puts completed `Future` on `BlockingQueue`
+- `take()`/`poll()` retrieve results from queue as they complete
+
+---
+
+### 6.3.6 Example: Page Renderer with CompletionService
+
+```java
+public class Renderer {
+    private final ExecutorService executor;
+    
+    void renderPage(CharSequence source) {
+        List<ImageInfo> info = scanForImageInfo(source);
+        CompletionService<ImageData> completionService =
+            new ExecutorCompletionService<>(executor);
+        
+        // Submit all download tasks
+        for (final ImageInfo imageInfo : info)
+            completionService.submit(() -> imageInfo.downloadImage());
+        
+        renderText(source);  // Render text while images download
+        
+        try {
+            for (int t = 0, n = info.size(); t < n; t++) {
+                Future<ImageData> f = completionService.take();  // Get next completed
+                ImageData imageData = f.get();
+                renderImage(imageData);  // Display as soon as ready
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (ExecutionException e) {
+            throw launderThrowable(e.getCause());
+        }
+    }
+}
+```
+
+**Improvements**:
+- ✓ **Parallel downloads**: All images download concurrently
+- ✓ **Progressive rendering**: Display each image as it arrives
+- ✓ **Better responsiveness**: User sees dynamic updates
+
+**Pattern**: Track number of submitted tasks, count completions to know when batch is done
+
+---
+
+### 6.3.7 Placing Time Limits on Tasks
+
+**Scenarios requiring timeouts**:
+- Web ads that shouldn't delay page load
+- Portal fetching data from multiple sources with time budget
+- Any task where old results are worthless
+
+**Primary challenge**: Don't wait longer than time budget
+
+**Solution**: Timed `Future.get()`
+
+```java
+Page renderPageWithAd() throws InterruptedException {
+    long endNanos = System.nanoTime() + TIME_BUDGET;
+    Future<Ad> f = exec.submit(new FetchAdTask());
+    
+    Page page = renderPageBody();  // Render while ad loads
+    Ad ad;
+    
+    try {
+        long timeLeft = endNanos - System.nanoTime();
+        ad = f.get(timeLeft, NANOSECONDS);  // Wait only remaining time
+    } catch (ExecutionException e) {
+        ad = DEFAULT_AD;
+    } catch (TimeoutException e) {
+        ad = DEFAULT_AD;
+        f.cancel(true);  // Cancel task to free resources
+    }
+    
+    page.setAd(ad);
+    return page;
+}
+```
+
+**Secondary challenge**: Stop tasks when time expires
+- Avoids wasting resources on unused results
+- Cancel via `Future.cancel(true)` if task is cancellable
+
+---
+
+### 6.3.8 Example: Travel Reservations Portal
+
+**Scenario**: Fetch quotes from multiple travel companies with time budget
+
+**Solution**: `invokeAll()` with timeout
+
+```java
+public List<TravelQuote> getRankedTravelQuotes(
+        TravelInfo travelInfo, 
+        Set<TravelCompany> companies,
+        Comparator<TravelQuote> ranking, 
+        long time, TimeUnit unit)
+        throws InterruptedException {
+    
+    List<QuoteTask> tasks = new ArrayList<>();
+    for (TravelCompany company : companies)
+        tasks.add(new QuoteTask(company, travelInfo));
+    
+    // Submit all, wait for timeout
+    List<Future<TravelQuote>> futures = exec.invokeAll(tasks, time, unit);
+    
+    List<TravelQuote> quotes = new ArrayList<>(tasks.size());
+    Iterator<QuoteTask> taskIter = tasks.iterator();
+    
+    for (Future<TravelQuote> f : futures) {
+        QuoteTask task = taskIter.next();
+        try {
+            quotes.add(f.get());  // Completed or cancelled
+        } catch (ExecutionException e) {
+            quotes.add(task.getFailureQuote(e.getCause()));
+        } catch (CancellationException e) {
+            quotes.add(task.getTimeoutQuote(e));  // Timed out
+        }
+    }
+    
+    Collections.sort(quotes, ranking);
+    return quotes;
+}
+```
+
+**`invokeAll()` behavior**:
+- Takes collection of tasks, returns collection of `Future`s
+- Maintains order (task collection iterator order)
+- Returns when: all complete, thread interrupted, OR timeout expires
+- Incomplete tasks are cancelled on timeout
+
+---
+
+## Summary
+
+### Key Concepts:
+
+1. **Task-based structure** simplifies development and enables concurrency
+2. **Executor framework** decouples submission from execution
+3. **Thread pools** provide resource management and better performance
+4. **Sensible task boundaries** are crucial for exploiting parallelism
+
+### Best Practices:
+
+✓ **Use Executor instead of `new Thread()`**
+- More flexible, configurable, manageable
+
+✓ **Choose appropriate execution policy**
+- Fixed pool for bounded resources
+- Cached pool for many short tasks
+- Single thread for sequential execution
+- Scheduled pool for periodic tasks
+
+✓ **Identify homogeneous, independent tasks**
+- Real parallelism comes from many similar tasks
+- Heterogeneous tasks have limited speedup
+
+✓ **Use Future and Callable for results**
+- Better than Runnable for deferred computations
+- Provides cancellation and exception handling
+
+✓ **Use CompletionService for progressive results**
+- Process results as they become available
+- Better responsiveness
+
+✓ **Set time budgets where appropriate**
+- Timed `get()` prevents indefinite waiting
+- Cancel tasks that exceed budget
+
+✓ **Properly handle ExecutorService lifecycle**
+- Call `shutdown()` when done
+- Handle `RejectedExecutionException`
+
+### Anti-Patterns to Avoid:
+
+✗ **Unbounded thread creation** (`new Thread()` per task)
+✗ **Using Timer** (use `ScheduledThreadPoolExecutor` instead)
+✗ **Ignoring InterruptedException** (propagate or restore status)
+✗ **Not shutting down executors** (prevents JVM exit)
+
+### Quick Reference:
+
+| Need | Use |
+|------|-----|
+| Execute tasks with bounded threads | `newFixedThreadPool(n)` |
+| Execute many short-lived tasks | `newCachedThreadPool()` |
+| Sequential task execution | `newSingleThreadExecutor()` |
+| Scheduled/periodic tasks | `newScheduledThreadPool(n)` |
+| Get result from task | `Callable` + `Future` |
+| Process results as they complete | `CompletionService` |
+| Time-limited task execution | `Future.get(timeout, unit)` |
+| Batch of tasks with timeout | `invokeAll(tasks, timeout, unit)` |
+
+### Performance Tips:
+
+- Size thread pools based on available CPUs and task characteristics (more in Chapter 8)
+- Use `CompletionService` for large batches of independent tasks
+- Cancel futures when results no longer needed
+- Consider parallelizing only when tasks are numerous and independent
+
 
