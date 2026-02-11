@@ -4465,3 +4465,476 @@ public class NativeLibraryProxy {
 5. **Provide feedback** – progress indicators and completion notifications
 6. **Consider split models** – when sharing data between EDT and application threads
 
+---
+
+# Chapter 10 – Avoiding Liveness Hazards
+
+There is often a tension between safety and liveness. We use locking to ensure thread safety, but indiscriminate use of locking can cause lock-ordering deadlocks. Java applications do not recover from deadlock, so it is essential to design systems that preclude the conditions that cause it.
+
+---
+
+## Deadlock
+
+Deadlock is illustrated by the classic **dining philosophers** problem: five philosophers share five chopsticks (one between each pair). Each needs two chopsticks to eat. If each grabs the left chopstick and waits for the right one, all starve—this is deadlock.
+
+### Definition
+
+When thread A holds lock L and tries to acquire lock M, while thread B holds M and tries to acquire L, both threads wait forever. This is the simplest case of deadlock (or **deadly embrace**).
+
+**Graph model**: Think of threads as nodes in a directed graph where edges represent "waiting for a resource held by". If the graph is cyclic, there is a deadlock.
+
+### JVM vs Database Handling
+
+| System | Deadlock Handling |
+|--------|-------------------|
+| **Database** | Detects cycles, picks a victim, aborts transaction, allows retry |
+| **JVM** | No recovery—deadlocked threads are permanently out of commission |
+
+Deadlocks rarely manifest immediately. They often appear under heavy production load at the worst possible time.
+
+---
+
+## Lock-ordering Deadlocks
+
+```java
+// Warning: deadlock-prone!
+public class LeftRightDeadlock {
+    private final Object left = new Object();
+    private final Object right = new Object();
+
+    public void leftRight() {
+        synchronized (left) {
+            synchronized (right) {
+                doSomething();
+            }
+        }
+    }
+
+    public void rightLeft() {
+        synchronized (right) {
+            synchronized (left) {
+                doSomethingElse();
+            }
+        }
+    }
+}
+```
+
+**Problem**: Two threads acquire the same locks in different orders.
+
+**Solution**: If all threads acquire locks L and M in the same order, there will be no cyclic dependency and no deadlock.
+
+> A program will be free of lock-ordering deadlocks if all threads acquire the locks they need in a fixed global order.
+
+---
+
+## Dynamic Lock Order Deadlocks
+
+Sometimes lock order depends on runtime arguments:
+
+```java
+// Warning: deadlock-prone!
+public void transferMoney(Account fromAccount,
+                          Account toAccount,
+                          DollarAmount amount)
+        throws InsufficientFundsException {
+    synchronized (fromAccount) {
+        synchronized (toAccount) {
+            if (fromAccount.getBalance().compareTo(amount) < 0)
+                throw new InsufficientFundsException();
+            else {
+                fromAccount.debit(amount);
+                toAccount.credit(amount);
+            }
+        }
+    }
+}
+```
+
+**Deadlock scenario**:
+```java
+A: transferMoney(myAccount, yourAccount, 10);
+B: transferMoney(yourAccount, myAccount, 20);
+```
+
+Thread A locks `myAccount`, waits for `yourAccount`. Thread B locks `yourAccount`, waits for `myAccount`.
+
+### Solution: Induce Lock Ordering
+
+Use `System.identityHashCode` to create a consistent ordering:
+
+```java
+private static final Object tieLock = new Object();
+
+public void transferMoney(final Account fromAcct,
+                          final Account toAcct,
+                          final DollarAmount amount)
+        throws InsufficientFundsException {
+    class Helper {
+        public void transfer() throws InsufficientFundsException {
+            if (fromAcct.getBalance().compareTo(amount) < 0)
+                throw new InsufficientFundsException();
+            else {
+                fromAcct.debit(amount);
+                toAcct.credit(amount);
+            }
+        }
+    }
+
+    int fromHash = System.identityHashCode(fromAcct);
+    int toHash = System.identityHashCode(toAcct);
+
+    if (fromHash < toHash) {
+        synchronized (fromAcct) {
+            synchronized (toAcct) {
+                new Helper().transfer();
+            }
+        }
+    } else if (fromHash > toHash) {
+        synchronized (toAcct) {
+            synchronized (fromAcct) {
+                new Helper().transfer();
+            }
+        }
+    } else {
+        synchronized (tieLock) {  // Tie-breaker for hash collisions
+            synchronized (fromAcct) {
+                synchronized (toAcct) {
+                    new Helper().transfer();
+                }
+            }
+        }
+    }
+}
+```
+
+**Key points**:
+- Order locks by hash code (or any unique comparable key like account number)
+- Use a tie-breaking lock for rare hash collisions
+- Hash collisions are vanishingly rare, so the tie-breaker rarely becomes a bottleneck
+
+---
+
+## Deadlocks Between Cooperating Objects
+
+Deadlocks can occur across object boundaries:
+
+```java
+// Warning: deadlock-prone!
+class Taxi {
+    @GuardedBy("this") private Point location, destination;
+    private final Dispatcher dispatcher;
+
+    public synchronized void setLocation(Point location) {
+        this.location = location;
+        if (location.equals(destination))
+            dispatcher.notifyAvailable(this);  // Calls alien method while holding lock
+    }
+}
+
+class Dispatcher {
+    @GuardedBy("this") private final Set<Taxi> taxis;
+    @GuardedBy("this") private final Set<Taxi> availableTaxis;
+
+    public synchronized void notifyAvailable(Taxi taxi) {
+        availableTaxis.add(taxi);
+    }
+
+    public synchronized Image getImage() {
+        Image image = new Image();
+        for (Taxi t : taxis)
+            image.drawMarker(t.getLocation());  // Calls into Taxi while holding lock
+        return image;
+    }
+}
+```
+
+**Problem**:
+- `setLocation`: acquires Taxi lock → Dispatcher lock
+- `getImage`: acquires Dispatcher lock → Taxi lock
+
+**Warning sign**: Calling an **alien method** (a method you don't control) while holding a lock.
+
+> Invoking an alien method with a lock held is asking for liveness trouble.
+
+---
+
+## Open Calls
+
+An **open call** is a method call made with no locks held.
+
+### Benefits of Open Calls
+
+- Easier to analyze for deadlock freedom
+- More composable classes
+- Analogous to encapsulation for thread safety
+
+### Refactored Taxi and Dispatcher
+
+```java
+@ThreadSafe
+class Taxi {
+    @GuardedBy("this") private Point location, destination;
+    private final Dispatcher dispatcher;
+
+    public synchronized Point getLocation() {
+        return location;
+    }
+
+    public void setLocation(Point location) {
+        boolean reachedDestination;
+        synchronized (this) {
+            this.location = location;
+            reachedDestination = location.equals(destination);
+        }
+        if (reachedDestination)
+            dispatcher.notifyAvailable(this);  // Open call
+    }
+}
+
+@ThreadSafe
+class Dispatcher {
+    @GuardedBy("this") private final Set<Taxi> taxis;
+    @GuardedBy("this") private final Set<Taxi> availableTaxis;
+
+    public synchronized void notifyAvailable(Taxi taxi) {
+        availableTaxis.add(taxi);
+    }
+
+    public Image getImage() {
+        Set<Taxi> copy;
+        synchronized (this) {
+            copy = new HashSet<Taxi>(taxis);  // Copy under lock
+        }
+        Image image = new Image();
+        for (Taxi t : copy)
+            image.drawMarker(t.getLocation());  // Open call
+        return image;
+    }
+}
+```
+
+**Trade-off**: Loss of atomicity. The refactored `getImage` fetches locations at slightly different times rather than as a complete snapshot. Often this is acceptable.
+
+> Strive to use open calls throughout your program.
+
+---
+
+## Resource Deadlocks
+
+Threads can deadlock waiting for resources, not just locks.
+
+### Connection Pool Deadlock
+
+If tasks require connections to two databases (D1 and D2) and don't request them in the same order:
+- Thread A holds D1 connection, waits for D2
+- Thread B holds D2 connection, waits for D1
+
+### Thread-starvation Deadlock
+
+A task that submits another task and waits for its result in a single-threaded `Executor` will wait forever:
+
+```java
+ExecutorService exec = Executors.newSingleThreadExecutor();
+
+exec.submit(() -> {
+    Future<?> inner = exec.submit(() -> doWork());
+    inner.get();  // Deadlock! Outer task blocks the only thread
+});
+```
+
+> Tasks that wait for results of other tasks are the primary source of thread-starvation deadlock. Bounded pools and interdependent tasks do not mix well.
+
+---
+
+## Avoiding and Diagnosing Deadlocks
+
+### Prevention Strategies
+
+1. **Minimize lock acquisition**: A program that never acquires more than one lock at a time cannot experience lock-ordering deadlock
+
+2. **Document lock ordering**: Make lock ordering part of your design
+
+3. **Use open calls**: Makes it easier to identify code paths that acquire multiple locks
+
+4. **Two-part audit strategy**:
+   - Identify where multiple locks could be acquired
+   - Perform global analysis to ensure consistent ordering
+
+### Timed Lock Attempts
+
+Use explicit `Lock` with `tryLock` timeout instead of intrinsic locks:
+
+```java
+if (lock.tryLock(timeout, TimeUnit.MILLISECONDS)) {
+    try {
+        // do work
+    } finally {
+        lock.unlock();
+    }
+} else {
+    // Handle timeout: log, back off, retry
+}
+```
+
+**Benefits**:
+- Regain control when something goes wrong
+- Can release locks, back off, and retry
+- Log useful diagnostic information
+
+---
+
+## Thread Dumps for Deadlock Analysis
+
+The JVM can identify deadlocks via thread dumps.
+
+### Triggering a Thread Dump
+
+| Platform | Method |
+|----------|--------|
+| Unix | `kill -3 <pid>` or `Ctrl-\` |
+| Windows | `Ctrl-Break` |
+| IDEs | Built-in thread dump feature |
+
+### Example Deadlock in Thread Dump
+
+```
+Found one Java-level deadlock:
+=============================
+"ApplicationServerThread":
+  waiting to lock monitor 0x080f0cdc (a MumbleDBConnection),
+  which is held by "ApplicationServerThread"
+"ApplicationServerThread":
+  waiting to lock monitor 0x080f0ed4 (a MumbleDBCallableStatement),
+  which is held by "ApplicationServerThread"
+
+Java stack information for the threads listed above:
+"ApplicationServerThread":
+  at MumbleDBConnection.remove_statement
+  - waiting to lock <0x650f7f30> (a MumbleDBConnection)
+  at MumbleDBStatement.close
+  - locked <0x6024ffb0> (a MumbleDBCallableStatement)
+  ...
+"ApplicationServerThread":
+  at MumbleDBCallableStatement.sendBatch
+  - waiting to lock <0x6024ffb0> (a MumbleDBCallableStatement)
+  at MumbleDBConnection.commit
+  - locked <0x650f7f30> (a MumbleDBConnection)
+```
+
+**Note**: Java 5 thread dumps don't show explicit `Lock` information. Java 6+ includes support for explicit locks but with less precise acquisition location.
+
+---
+
+## Other Liveness Hazards
+
+### Starvation
+
+A thread is perpetually denied resources it needs to make progress.
+
+**Causes**:
+- Inappropriate use of thread priorities
+- Holding a lock while executing non-terminating constructs (infinite loops, resource waits)
+
+**Advice**:
+> Avoid the temptation to use thread priorities, since they increase platform dependence and can cause liveness problems. Most concurrent applications can use the default priority for all threads.
+
+Thread priorities are merely scheduling hints and map differently across platforms.
+
+### Poor Responsiveness
+
+**Causes**:
+- CPU-intensive background tasks competing with event thread
+- Holding locks for long periods (e.g., iterating large collections)
+
+**Solution**: Lower priority of truly background tasks; minimize lock hold times.
+
+### Livelock
+
+A thread is not blocked but cannot make progress because it keeps retrying an operation that always fails.
+
+**Example: Poison Message Problem**
+
+```
+1. Message handler fails processing message
+2. Transaction rolls back, message goes back to queue head
+3. Message is dequeued again
+4. Handler fails again
+5. Repeat forever...
+```
+
+The thread is not blocked, but it never makes progress.
+
+**Example: Overly Polite Threads**
+
+Two threads keep changing state in response to each other, like two people in a hallway who keep stepping aside into each other's path.
+
+**Solution**: Introduce randomness and exponential back-off (like Ethernet collision handling):
+
+```java
+int attempts = 0;
+while (!success && attempts < MAX_ATTEMPTS) {
+    try {
+        success = tryOperation();
+    } catch (ConflictException e) {
+        attempts++;
+        // Random back-off with exponential increase
+        Thread.sleep(random.nextInt(baseDelay * (1 << attempts)));
+    }
+}
+```
+
+---
+
+## Summary
+
+### Liveness Hazard Types
+
+| Hazard | Description | Solution |
+|--------|-------------|----------|
+| **Deadlock** | Threads wait forever for locks held by each other | Consistent lock ordering, open calls |
+| **Resource Deadlock** | Threads wait forever for resources | Consistent resource acquisition order |
+| **Thread-starvation Deadlock** | Task waits for result of task in same bounded pool | Don't mix interdependent tasks with bounded pools |
+| **Starvation** | Thread perpetually denied resources | Avoid thread priority manipulation |
+| **Livelock** | Thread not blocked but cannot progress | Random back-off and retry |
+
+### Deadlock Prevention Checklist
+
+- [ ] Acquire locks in a fixed global order
+- [ ] Use open calls (no alien method calls while holding locks)
+- [ ] Minimize the number of locks held simultaneously
+- [ ] Shrink synchronized blocks to minimum necessary
+- [ ] Use timed `tryLock` for recovery capability
+- [ ] Document lock ordering protocols
+- [ ] Audit code for multiple lock acquisitions
+
+### Key Patterns
+
+| Pattern | Purpose |
+|---------|---------|
+| **Lock ordering by hash code** | Consistent ordering for dynamic lock acquisition |
+| **Tie-breaking lock** | Handle hash collisions in lock ordering |
+| **Open calls** | Prevent alien method deadlocks |
+| **Copy-then-iterate** | Release lock before iterating |
+| **Timed tryLock** | Detect and recover from potential deadlocks |
+| **Random back-off** | Prevent livelock |
+
+### Anti-Patterns to Avoid
+
+❌ Acquiring locks in inconsistent order
+❌ Calling alien methods while holding locks
+❌ Using synchronized methods when smaller blocks suffice
+❌ Submitting interdependent tasks to bounded thread pools
+❌ Manipulating thread priorities
+❌ Holding locks during long operations
+❌ Retrying failed operations without back-off
+
+### Design Principles
+
+1. **Lock ordering must be part of your design** – not an afterthought
+2. **Open calls are analogous to encapsulation** – they make analysis tractable
+3. **The left hand needs to know what the right hand is doing** – global analysis required
+4. **Deadlocks manifest under load** – testing may not reveal them
+5. **There is no recovery from deadlock** – prevention is the only option
+
+
