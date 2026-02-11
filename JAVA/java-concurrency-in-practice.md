@@ -4937,4 +4937,556 @@ while (!success && attempts < MAX_ATTEMPTS) {
 4. **Deadlocks manifest under load** – testing may not reveal them
 5. **There is no recovery from deadlock** – prevention is the only option
 
+---
+
+# Chapter 11 – Performance and Scalability
+
+One of the primary reasons to use threads is to improve performance—utilizing processing resources more effectively and improving responsiveness. However, many techniques for improving performance also increase complexity, raising the likelihood of safety and liveness failures.
+
+> First make your program right, then make it fast—and then only if your performance requirements and measurements tell you it needs to be faster.
+
+---
+
+## Thinking About Performance
+
+**Improving performance** means doing more work with fewer resources. Performance can be limited by various resources:
+- CPU cycles (CPU-bound)
+- Memory
+- Network bandwidth
+- I/O bandwidth
+- Database requests
+
+### Threading Costs vs Benefits
+
+Threading always introduces costs:
+- Coordination overhead (locking, signaling, memory synchronization)
+- Context switching
+- Thread creation and teardown
+- Scheduling overhead
+
+When threading is employed effectively, these costs are outweighed by greater throughput, responsiveness, or capacity.
+
+---
+
+## Performance vs Scalability
+
+| Aspect | Measures | Focus |
+|--------|----------|-------|
+| **Performance** | Service time, latency | "How fast" – processing speed of individual units |
+| **Scalability** | Throughput, capacity | "How much" – work done with given/additional resources |
+
+**Scalability**: The ability to improve throughput or capacity when additional computing resources are added.
+
+### Key Insight: Performance and Scalability Can Conflict
+
+- **Performance tuning**: Do the same work with less effort (caching, better algorithms)
+- **Scalability tuning**: Parallelize to use more resources effectively
+
+Many single-threaded performance tricks are bad for scalability.
+
+### The Three-Tier Example
+
+A monolithic application outperforms a distributed three-tier system for the first unit of work (no network latency, no coordination overhead). But when the monolithic system reaches capacity, scaling is prohibitively difficult.
+
+> We often accept performance costs of longer service time so that our application can scale to handle greater load.
+
+For server applications, scalability is usually more important than raw speed.
+
+---
+
+## Evaluating Performance Tradeoffs
+
+Before optimizing, ask:
+- What do you mean by "faster"?
+- Under what conditions will this be faster? (light/heavy load, small/large data)
+- How often will these conditions arise?
+- What hidden costs are you trading? (development risk, maintenance complexity)
+
+> Avoid premature optimization. First make it right, then make it fast—if it is not already fast enough.
+
+### The Concurrency Bug Risk
+
+> The quest for performance is probably the single greatest source of concurrency bugs.
+
+The belief that synchronization is "too slow" has led to dangerous idioms like double-checked locking.
+
+> Measure, don't guess.
+
+---
+
+## Amdahl's Law
+
+Amdahl's law describes how much a program can theoretically be sped up by additional computing resources:
+
+$$Speedup \leq \frac{1}{F + \frac{(1-F)}{N}}$$
+
+Where:
+- **F** = fraction that must be executed serially
+- **N** = number of processors
+
+As N → ∞, maximum speedup converges to **1/F**.
+
+### Implications
+
+| Serial Fraction | Max Speedup | Notes |
+|-----------------|-------------|-------|
+| 50% | 2x | No matter how many processors |
+| 10% | 10x | Theoretical maximum |
+| 1% | 100x | Rare to achieve in practice |
+
+### Utilization Under Amdahl's Law
+
+With 10% serialization:
+- 10 processors: speedup of 5.3x (53% utilization)
+- 100 processors: speedup of 9.2x (9% utilization)
+
+Even small serialization percentages devastate scalability at high processor counts.
+
+### Sources of Serialization
+
+```java
+public class WorkerThread extends Thread {
+    private final BlockingQueue<Runnable> queue;
+
+    public void run() {
+        while (true) {
+            try {
+                Runnable task = queue.take();  // Serialization point!
+                task.run();
+            } catch (InterruptedException e) {
+                break;
+            }
+        }
+    }
+}
+```
+
+**Common serialization sources**:
+- Shared work queues
+- Result handling (log files, shared data structures)
+- Any shared data structure access
+
+> All concurrent applications have some sources of serialization; if you think yours does not, look again.
+
+### Framework Comparison Example
+
+| Implementation | Scalability | Why |
+|----------------|-------------|-----|
+| `ConcurrentLinkedQueue` | Excellent | Non-blocking algorithm, only pointer updates serialized |
+| `synchronizedList(LinkedList)` | Poor | Entire operation serialized, heavy contention |
+
+The synchronized version shows improvement up to ~3 threads, then degrades as contention dominates.
+
+### Thinking "In the Limit"
+
+When evaluating algorithms, consider what happens with hundreds or thousands of processors:
+- **Lock splitting** (one lock → two): Limited improvement
+- **Lock striping** (one lock → many): Promising scalability
+
+---
+
+## Costs Introduced by Threads
+
+### Context Switching
+
+When there are more runnable threads than CPUs, the OS preempts threads, causing context switches.
+
+**Costs**:
+- Saving/restoring execution context
+- OS and JVM data structure manipulation
+- Cache misses (new thread's data not in cache)
+
+**Rule of thumb**: A context switch costs **5,000–10,000 clock cycles** (several microseconds).
+
+**Monitoring**:
+- Unix: `vmstat` (context switches, kernel time)
+- Windows: `perfmon`
+
+High kernel usage (>10%) often indicates heavy scheduling activity from blocking or lock contention.
+
+### Memory Synchronization
+
+Synchronization costs come from:
+- **Memory barriers**: Flush/invalidate caches, stall pipelines
+- **Compiler optimization inhibition**: Operations can't be reordered across barriers
+
+**Uncontended vs Contended**:
+
+| Type | Cost | Notes |
+|------|------|-------|
+| Uncontended | 20–250 clock cycles | Optimized by JVM |
+| Contended | Much higher | May involve OS, context switches |
+
+### JVM Optimizations
+
+**Lock elision**: JVM removes locks on thread-local objects:
+
+```java
+public String getStoogeNames() {
+    List<String> stooges = new Vector<String>();  // Thread-local
+    stooges.add("Moe");
+    stooges.add("Larry");
+    stooges.add("Curly");
+    return stooges.toString();
+}
+// JVM can eliminate all 4 lock acquisitions
+```
+
+**Lock coarsening**: JVM merges adjacent synchronized blocks on the same lock.
+
+> Don't worry excessively about the cost of uncontended synchronization. Focus optimization efforts on areas where lock contention actually occurs.
+
+### Blocking
+
+When locking is contended, JVM can:
+1. **Spin-wait**: Repeatedly try to acquire (good for short waits)
+2. **Suspend**: OS context switch (good for long waits)
+
+Suspension causes **two additional context switches** plus cache effects.
+
+---
+
+## Reducing Lock Contention
+
+> The principal threat to scalability in concurrent applications is the exclusive resource lock.
+
+**Two factors determine contention likelihood**:
+1. How often the lock is requested
+2. How long it is held once acquired
+
+**Three ways to reduce lock contention**:
+1. Reduce duration locks are held
+2. Reduce frequency locks are requested
+3. Replace exclusive locks with more concurrent alternatives
+
+---
+
+### 1. Narrowing Lock Scope ("Get in, Get out")
+
+Hold locks as briefly as possible.
+
+**Before** – holding lock too long:
+
+```java
+@ThreadSafe
+public class AttributeStore {
+    @GuardedBy("this")
+    private final Map<String, String> attributes = new HashMap<>();
+
+    public synchronized boolean userLocationMatches(String name, String regexp) {
+        String key = "users." + name + ".location";  // No lock needed
+        String location = attributes.get(key);        // Needs lock
+        if (location == null)
+            return false;
+        else
+            return Pattern.matches(regexp, location); // No lock needed
+    }
+}
+```
+
+**After** – minimized lock scope:
+
+```java
+@ThreadSafe
+public class BetterAttributeStore {
+    @GuardedBy("this")
+    private final Map<String, String> attributes = new HashMap<>();
+
+    public boolean userLocationMatches(String name, String regexp) {
+        String key = "users." + name + ".location";
+        String location;
+        synchronized (this) {
+            location = attributes.get(key);  // Only this needs the lock
+        }
+        if (location == null)
+            return false;
+        else
+            return Pattern.matches(regexp, location);
+    }
+}
+```
+
+**Even better**: Delegate to a thread-safe `ConcurrentHashMap`, eliminating explicit synchronization entirely.
+
+> A synchronized block can be too small—operations that must be atomic need to stay together.
+
+---
+
+### 2. Reducing Lock Granularity (Lock Splitting)
+
+Use separate locks to guard independent state variables.
+
+**Before** – single lock guards independent state:
+
+```java
+@ThreadSafe
+public class ServerStatus {
+    @GuardedBy("this") public final Set<String> users;
+    @GuardedBy("this") public final Set<String> queries;
+
+    public synchronized void addUser(String u) { users.add(u); }
+    public synchronized void addQuery(String q) { queries.add(q); }
+    public synchronized void removeUser(String u) { users.remove(u); }
+    public synchronized void removeQuery(String q) { queries.remove(q); }
+}
+```
+
+**After** – split locks for independent state:
+
+```java
+@ThreadSafe
+public class ServerStatus {
+    @GuardedBy("users") public final Set<String> users;
+    @GuardedBy("queries") public final Set<String> queries;
+
+    public void addUser(String u) {
+        synchronized (users) { users.add(u); }
+    }
+    public void addQuery(String q) {
+        synchronized (queries) { queries.add(q); }
+    }
+}
+```
+
+**When it helps**: Moderate contention → mostly uncontended locks (best outcome).
+
+---
+
+### 3. Lock Striping
+
+Partition locking on a variable-sized set of independent objects.
+
+**Example**: `ConcurrentHashMap` uses 16 locks, each guarding 1/16 of hash buckets:
+
+```java
+@ThreadSafe
+public class StripedMap {
+    private static final int N_LOCKS = 16;
+    private final Node[] buckets;
+    private final Object[] locks;
+
+    public StripedMap(int numBuckets) {
+        buckets = new Node[numBuckets];
+        locks = new Object[N_LOCKS];
+        for (int i = 0; i < N_LOCKS; i++)
+            locks[i] = new Object();
+    }
+
+    private final int hash(Object key) {
+        return Math.abs(key.hashCode() % buckets.length);
+    }
+
+    public Object get(Object key) {
+        int hash = hash(key);
+        synchronized (locks[hash % N_LOCKS]) {
+            for (Node m = buckets[hash]; m != null; m = m.next)
+                if (m.key.equals(key))
+                    return m.value;
+        }
+        return null;
+    }
+
+    public void clear() {
+        for (int i = 0; i < buckets.length; i++) {
+            synchronized (locks[i % N_LOCKS]) {
+                buckets[i] = null;
+            }
+        }
+    }
+}
+```
+
+**Trade-off**: Locking the entire collection (e.g., for rehashing) requires acquiring all stripe locks.
+
+---
+
+### 4. Avoiding Hot Fields
+
+**Hot field**: A variable that every operation must access, limiting lock granularity.
+
+**Example**: Caching `size()` in a counter
+
+```java
+// Single-threaded optimization becomes scalability liability
+private int count;  // Updated on every put/remove
+
+public int size() {
+    return count;  // O(1) but creates hot field
+}
+```
+
+**ConcurrentHashMap solution**: Maintain separate count per stripe, enumerate on `size()` call.
+
+---
+
+### 5. Alternatives to Exclusive Locks
+
+| Alternative | Use Case |
+|-------------|----------|
+| `ReadWriteLock` | Read-mostly data (multiple readers, single writer) |
+| Immutable objects | Read-only data (no locking needed) |
+| Atomic variables | Hot fields like counters, sequence generators |
+| Concurrent collections | Replace synchronized wrappers |
+
+> Atomic variables reduce the cost of updating hot fields, but don't eliminate it. Changing your algorithm to have fewer hot fields might improve scalability even more.
+
+---
+
+## Monitoring CPU Utilization
+
+**Tools**:
+- Unix: `vmstat`, `mpstat`, `iostat`
+- Windows: `perfmon`
+
+### Diagnosing Underutilized CPUs
+
+| Symptom | Likely Cause | Solution |
+|---------|--------------|----------|
+| Asymmetric CPU usage | Work concentrated in few threads | Find more parallelism |
+| Low utilization, low load | Insufficient load | Increase test load |
+| Low utilization, high I/O | I/O-bound | Optimize I/O, add async processing |
+| Low utilization, external waits | External service bottleneck | Profile external dependencies |
+| Low utilization, lock contention | Contended locks | Reduce lock scope/granularity |
+
+**Thread dump sampling**: Trigger a few thread dumps; heavily contended locks frequently appear as "waiting to lock monitor..."
+
+---
+
+## Object Pooling: Just Say No
+
+Object pooling was a workaround for slow allocation in early JVMs.
+
+**Modern reality**:
+- `new Object()` in HotSpot ≈ **10 machine instructions**
+- Java allocation is now **faster than C's `malloc`**
+
+**Why pooling hurts concurrency**:
+
+| Approach | Coordination Required |
+|----------|----------------------|
+| Allocation | Minimal (thread-local allocation blocks) |
+| Object pool | Synchronization on pool access |
+
+> Blocking a thread due to lock contention is hundreds of times more expensive than an allocation.
+
+> Allocating objects is usually cheaper than synchronizing.
+
+---
+
+## Comparing Map Performance
+
+| Implementation | Scalability | Reason |
+|----------------|-------------|--------|
+| `ConcurrentHashMap` | Excellent | Lock striping, no locking for most reads |
+| `ConcurrentSkipListMap` | Excellent | Lock-free algorithms |
+| `synchronizedMap(HashMap)` | Poor | Single lock for entire map |
+| `synchronizedMap(TreeMap)` | Poor | Single lock for entire map |
+
+**Observed behavior**:
+- Concurrent collections: Throughput improves with threads up to CPU count, then plateaus
+- Synchronized collections: Performance comparable at 1 thread, degrades severely at 2+ threads
+
+---
+
+## Reducing Context Switch Overhead
+
+**Example**: Logging approaches
+
+| Approach | Characteristics |
+|----------|-----------------|
+| Inline logging | Each thread writes directly; I/O blocks, lock contention on stream |
+| Background logging | Threads queue messages; dedicated thread handles I/O |
+
+### Why Background Logging Wins
+
+**Inline logging problems**:
+- Thread blocks on I/O → context switch
+- Lock contention on output stream → more blocking
+- Longer lock hold times → more contention
+
+**Background logging benefits**:
+- Request threads never block on I/O
+- Queue put is lightweight (less likely to block)
+- Single writer eliminates output stream contention
+- Straight-line code path instead of complex blocking path
+
+**Analogy**: Bucket brigade vs. individuals running with buckets
+- Bucket brigade: Constant flow, each worker does one job continuously
+- Individuals: Contention at source and destination, constant mode switching
+
+> Just as interruptions are disruptive to humans, blocking and context switching are disruptive to threads.
+
+---
+
+## Summary
+
+### Key Metrics
+
+| Metric | Description | Server Priority |
+|--------|-------------|-----------------|
+| Throughput | Work completed per unit time | High |
+| Scalability | Improvement with added resources | High |
+| Latency | Time to complete single operation | Medium |
+| Capacity | Maximum concurrent load | High |
+
+### Amdahl's Law Essentials
+
+- Serial fraction **F** limits maximum speedup to **1/F**
+- Small serialization percentages become critical at high processor counts
+- Sources of serialization: shared queues, result handling, any shared state
+
+### Lock Contention Reduction Techniques
+
+| Technique | Description | Scalability Benefit |
+|-----------|-------------|---------------------|
+| Narrow scope | Hold locks briefly | Moderate |
+| Lock splitting | Separate locks for independent state | Moderate |
+| Lock striping | Many locks for partitioned data | High |
+| Avoid hot fields | Don't cache if it creates contention | High |
+| Concurrent collections | Replace synchronized wrappers | High |
+| Read-write locks | Allow concurrent readers | Moderate-High |
+| Atomic variables | Lock-free updates for simple state | High |
+
+### Threading Costs
+
+| Cost | Magnitude | Mitigation |
+|------|-----------|------------|
+| Context switch | 5,000–10,000 cycles | Reduce blocking, contention |
+| Uncontended sync | 20–250 cycles | JVM optimizes; don't worry |
+| Contended sync | Much higher | Reduce contention |
+| Memory barriers | Variable | Unavoidable for visibility |
+
+### Anti-Patterns to Avoid
+
+❌ Premature optimization
+❌ Optimizing without measuring
+❌ Trading safety for performance
+❌ Object pooling (in most cases)
+❌ Holding locks during I/O or long computations
+❌ Using synchronized wrappers instead of concurrent collections
+❌ Caching values that create hot fields
+❌ Assuming synchronization is "too slow"
+
+### Performance Optimization Checklist
+
+- [ ] Establish concrete performance requirements
+- [ ] Measure current performance under realistic load
+- [ ] Identify actual bottlenecks (don't guess)
+- [ ] Consider scalability, not just raw speed
+- [ ] Evaluate serialization sources (Amdahl's Law)
+- [ ] Check CPU utilization and contention
+- [ ] Minimize lock scope and granularity
+- [ ] Use concurrent collections appropriately
+- [ ] Measure again after changes
+- [ ] Verify safety is preserved
+
+### Key Principles
+
+1. **Safety first** – correctness before performance
+2. **Measure, don't guess** – intuition about concurrency performance is often wrong
+3. **Scalability matters** – especially for server applications
+4. **Serialization is the enemy** – minimize time in exclusive locks
+5. **Contention is expensive** – uncontended locks are cheap, contended locks devastate performance
+6. **Allocation is fast** – don't pool objects to "save" allocations
+
 
