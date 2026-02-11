@@ -4060,4 +4060,408 @@ When configuring a thread pool, consider:
 - [ ] Resource constraints (memory, connections, handles)
 - [ ] Monitoring (logging, metrics, alerts)
 
+---
+
+# Chapter 9 – GUI Applications
+
+GUI applications have unique threading challenges. To maintain safety, certain tasks must run in the GUI event thread, but long-running tasks cannot execute there without making the UI unresponsive. Understanding how to properly divide work between the event thread and background threads is essential for building responsive, thread-safe GUI applications.
+
+---
+
+## Why GUIs Are Single-threaded
+
+Nearly all GUI toolkits—including Swing, SWT, Qt, MacOS Cocoa, and X Windows—use a **single-threaded event queue model**. A dedicated **event dispatch thread (EDT)** fetches events from a queue and dispatches them to application-defined handlers.
+
+### Failed Attempts at Multithreaded GUIs
+
+Multithreaded GUI frameworks have been attempted but consistently failed due to:
+
+1. **Inconsistent Lock Ordering**: User actions "bubble up" from OS to application, while application actions "bubble down" to the OS. This bidirectional flow accessing the same GUI objects leads to deadlock.
+
+2. **MVC Pattern Complications**: The Model-View-Controller pattern exacerbates lock ordering issues:
+   - Controller → Model → View (notifications)
+   - Controller → View → Model (queries)
+
+   This creates circular dependencies prone to deadlock.
+
+3. **Complexity Barrier**: As Graham Hamilton noted, multithreaded GUI toolkits require intimate knowledge of the entire toolkit structure, which doesn't scale to widespread use.
+
+---
+
+## Thread Confinement in Swing
+
+Single-threaded GUI frameworks achieve thread safety through **thread confinement**—all GUI objects are accessed exclusively from the event thread.
+
+### The Swing Single-thread Rule
+
+> Swing components and models should be created, modified, and queried only from the event-dispatching thread.
+
+### Exceptions to the Rule
+
+A few Swing methods are thread-safe and callable from any thread:
+
+- `SwingUtilities.isEventDispatchThread()` – check if current thread is EDT
+- `SwingUtilities.invokeLater(Runnable)` – schedule task on EDT
+- `SwingUtilities.invokeAndWait(Runnable)` – schedule and block until complete
+- Repaint/revalidation requests
+- Listener add/remove methods
+
+---
+
+## Sequential Event Processing
+
+Because GUI tasks run on a single thread, they execute sequentially—one task finishes before the next begins. This simplifies task code (no interference worries) but creates a critical constraint:
+
+**Tasks in the event thread must return control quickly.**
+
+If a lengthy task runs in the event thread:
+- The UI appears frozen
+- Users cannot click buttons (even "Cancel")
+- No visual feedback occurs
+
+---
+
+## Implementing SwingUtilities with Executor
+
+The threading methods in `SwingUtilities` are conceptually similar to an `Executor`:
+
+```java
+public class SwingUtilities {
+    private static final ExecutorService exec =
+        Executors.newSingleThreadExecutor(new SwingThreadFactory());
+    private static volatile Thread swingThread;
+
+    private static class SwingThreadFactory implements ThreadFactory {
+        public Thread newThread(Runnable r) {
+            swingThread = new Thread(r);
+            return swingThread;
+        }
+    }
+
+    public static boolean isEventDispatchThread() {
+        return Thread.currentThread() == swingThread;
+    }
+
+    public static void invokeLater(Runnable task) {
+        exec.execute(task);
+    }
+
+    public static void invokeAndWait(Runnable task)
+            throws InterruptedException, InvocationTargetException {
+        Future f = exec.submit(task);
+        try {
+            f.get();
+        } catch (ExecutionException e) {
+            throw new InvocationTargetException(e);
+        }
+    }
+}
+```
+
+---
+
+## GuiExecutor Pattern
+
+A convenient `Executor` that delegates to `SwingUtilities`:
+
+```java
+public class GuiExecutor extends AbstractExecutorService {
+    private static final GuiExecutor instance = new GuiExecutor();
+
+    private GuiExecutor() { }
+
+    public static GuiExecutor instance() { return instance; }
+
+    public void execute(Runnable r) {
+        if (SwingUtilities.isEventDispatchThread())
+            r.run();
+        else
+            SwingUtilities.invokeLater(r);
+    }
+}
+```
+
+---
+
+## Short-running GUI Tasks
+
+For simple, short-running tasks, the entire action stays in the event thread:
+
+```java
+final Random random = new Random();
+final JButton button = new JButton("Change Color");
+
+button.addActionListener(new ActionListener() {
+    public void actionPerformed(ActionEvent e) {
+        button.setBackground(new Color(random.nextInt()));
+    }
+});
+```
+
+**Control flow**: Event originates in toolkit → delivered to listener → modifies GUI → control never leaves EDT.
+
+### Model-View Pattern
+
+With data models (like `TableModel`), the flow is:
+1. Action listener updates the model
+2. Model fires change events (`fireXxx` methods)
+3. View receives notification and queries model
+4. View updates display
+
+All of this happens within the event thread.
+
+---
+
+## Long-running GUI Tasks
+
+Tasks that take too long for the event thread must run in background threads. Use a cached thread pool:
+
+```java
+ExecutorService backgroundExec = Executors.newCachedThreadPool();
+
+button.addActionListener(new ActionListener() {
+    public void actionPerformed(ActionEvent e) {
+        backgroundExec.execute(new Runnable() {
+            public void run() { doBigComputation(); }
+        });
+    }
+});
+```
+
+### Thread Hopping with User Feedback
+
+Long-running tasks typically involve "thread hopping" between EDT and background threads:
+
+```java
+button.addActionListener(new ActionListener() {
+    public void actionPerformed(ActionEvent e) {
+        button.setEnabled(false);           // 1. Update UI (EDT)
+        label.setText("busy");
+
+        backgroundExec.execute(new Runnable() {
+            public void run() {
+                try {
+                    doBigComputation();      // 2. Long task (background)
+                } finally {
+                    GuiExecutor.instance().execute(new Runnable() {
+                        public void run() {
+                            button.setEnabled(true);   // 3. Update UI (EDT)
+                            label.setText("idle");
+                        }
+                    });
+                }
+            }
+        });
+    }
+});
+```
+
+---
+
+## Cancellation
+
+Use `Future` for managing cancellable tasks:
+
+```java
+Future<?> runningTask = null;  // thread-confined to EDT
+
+startButton.addActionListener(new ActionListener() {
+    public void actionPerformed(ActionEvent e) {
+        if (runningTask == null) {
+            runningTask = backgroundExec.submit(new Runnable() {
+                public void run() {
+                    while (moreWork()) {
+                        if (Thread.currentThread().isInterrupted()) {
+                            cleanUpPartialWork();
+                            break;
+                        }
+                        doSomeWork();
+                    }
+                }
+            });
+        }
+    }
+});
+
+cancelButton.addActionListener(new ActionListener() {
+    public void actionPerformed(ActionEvent event) {
+        if (runningTask != null)
+            runningTask.cancel(true);
+    }
+});
+```
+
+---
+
+## BackgroundTask Framework
+
+A reusable framework combining `FutureTask` with EDT callbacks:
+
+```java
+abstract class BackgroundTask<V> implements Runnable, Future<V> {
+    private final FutureTask<V> computation = new Computation();
+
+    private class Computation extends FutureTask<V> {
+        public Computation() {
+            super(new Callable<V>() {
+                public V call() throws Exception {
+                    return BackgroundTask.this.compute();
+                }
+            });
+        }
+
+        protected final void done() {
+            GuiExecutor.instance().execute(new Runnable() {
+                public void run() {
+                    V value = null;
+                    Throwable thrown = null;
+                    boolean cancelled = false;
+                    try {
+                        value = get();
+                    } catch (ExecutionException e) {
+                        thrown = e.getCause();
+                    } catch (CancellationException e) {
+                        cancelled = true;
+                    } catch (InterruptedException consumed) {
+                    } finally {
+                        onCompletion(value, thrown, cancelled);
+                    }
+                }
+            });
+        }
+    }
+
+    protected void setProgress(final int current, final int max) {
+        GuiExecutor.instance().execute(new Runnable() {
+            public void run() { onProgress(current, max); }
+        });
+    }
+
+    // Called in background thread
+    protected abstract V compute() throws Exception;
+
+    // Called in event thread
+    protected void onCompletion(V result, Throwable exception,
+                                boolean cancelled) { }
+    protected void onProgress(int current, int max) { }
+}
+```
+
+### Features
+
+- **Cancellation**: Check `isCancelled()` in `compute()`
+- **Progress**: Call `setProgress()` from background thread
+- **Completion**: Override `onCompletion()` for EDT notification
+
+---
+
+## SwingWorker (Java 6+)
+
+Java 6 introduced `SwingWorker`, which provides similar functionality to `BackgroundTask`:
+- Cancellation support
+- Completion notification
+- Progress indication
+
+---
+
+## Shared Data Models
+
+### Thread-safe Data Models
+
+When multiple threads need access to data:
+- Use thread-safe collections (e.g., `ConcurrentHashMap`)
+- Trade-off: May not provide consistent snapshots
+- Versioned structures like `CopyOnWriteArrayList` work when traversals >> modifications
+
+### Split Data Models
+
+For complex applications, use a **split-model design**:
+
+| Model | Thread | Characteristics |
+|-------|--------|-----------------|
+| **Presentation Model** | Event thread only | Swing's `TableModel`, `TreeModel` |
+| **Shared Model** | Thread-safe | Application domain data |
+
+**Synchronization approaches**:
+1. **Snapshot**: Embed relevant state in update messages
+2. **Incremental**: Send only changed data (more efficient for large models)
+
+---
+
+## Other Single-threaded Subsystems
+
+Thread confinement applies beyond GUIs:
+
+- **Native libraries**: Some require all access from the same thread
+- **Pattern**: Create a dedicated thread/executor, use a proxy to submit tasks
+
+```java
+// Proxy pattern for thread-confined resource
+public class NativeLibraryProxy {
+    private final ExecutorService executor =
+        Executors.newSingleThreadExecutor();
+
+    public Result doOperation(Params params) {
+        Future<Result> future = executor.submit(() ->
+            nativeLibrary.operation(params));
+        return future.get();  // Block for result
+    }
+}
+```
+
+---
+
+## Summary
+
+### Key Concepts
+
+| Concept | Description |
+|---------|-------------|
+| **Single-threaded GUI** | All GUI toolkits use single event thread due to deadlock issues in multithreaded attempts |
+| **Thread confinement** | GUI objects accessed only from EDT |
+| **Sequential processing** | Tasks run one at a time; long tasks freeze UI |
+| **Thread hopping** | Alternate between EDT and background threads |
+
+### Threading Rules for GUI Applications
+
+**In the Event Thread**:
+- All GUI component access
+- Short-running tasks only
+- Starting/scheduling background tasks
+- Updating UI after background completion
+
+**In Background Threads**:
+- Long-running computations
+- I/O operations
+- Network requests
+- File system operations
+
+### Patterns
+
+| Pattern | Purpose |
+|---------|---------|
+| `invokeLater` | Schedule task on EDT (non-blocking) |
+| `invokeAndWait` | Schedule task on EDT (blocking) |
+| `GuiExecutor` | Executor that delegates to EDT |
+| `BackgroundTask` | Reusable framework for cancellable background tasks |
+| `SwingWorker` | Built-in Java 6+ solution |
+| **Split model** | Separate presentation model (EDT) from shared model (thread-safe) |
+
+### Anti-Patterns to Avoid
+
+❌ Accessing Swing components from background threads
+❌ Running long operations in the event thread
+❌ Blocking the EDT with `invokeAndWait` from EDT itself
+❌ Ignoring thread confinement for data models
+❌ Not providing cancellation for long-running tasks
+❌ Forgetting to update UI after background task completes
+
+### Design Guidelines
+
+1. **Keep the EDT responsive** – never block it with long operations
+2. **Confine GUI objects** – access only from EDT
+3. **Use executors** – `newCachedThreadPool()` for background tasks
+4. **Support cancellation** – use `Future` and interruption
+5. **Provide feedback** – progress indicators and completion notifications
+6. **Consider split models** – when sharing data between EDT and application threads
 
